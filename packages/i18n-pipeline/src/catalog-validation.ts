@@ -70,6 +70,13 @@ export interface GeneratedCatalogCheck {
   updateCommand?: string;
   /** How a stale file is reported; defaults to "error". */
   severity?: "error" | "warning";
+  /**
+   * Fail when the generator prints `[WARN]` lines to stderr even though it exits 0.
+   * Extractors such as `@formatjs/cli` report duplicate message ids and non-literal
+   * `defaultMessage` values as warnings; both silently drop or merge catalog entries,
+   * so a green generator run can still have produced a broken catalog.
+   */
+  strictStderrWarnings?: boolean;
 }
 
 /** A directory whose catalog files must all be declared by the validation plan. */
@@ -174,6 +181,7 @@ function parseGeneratedCheck(value: unknown, label: string): GeneratedCatalogChe
       "args",
       "updateCommand",
       "severity",
+      "strictStderrWarnings",
     ],
     label,
   );
@@ -193,11 +201,13 @@ function parseGeneratedCheck(value: unknown, label: string): GeneratedCatalogChe
     throw new TypeError(`${label}.severity must be "error" or "warning"`);
   }
   const severity = entry.severity as GeneratedCatalogCheck["severity"];
+  const strictStderrWarnings = entry.strictStderrWarnings === true;
   const generator = {
     command,
     args,
     ...(updateCommand ? { updateCommand } : {}),
     ...(severity ? { severity } : {}),
+    ...(strictStderrWarnings ? { strictStderrWarnings: true } : {}),
   };
 
   if (entry.adapter === undefined) {
@@ -500,9 +510,25 @@ async function loadTmsCheck(projectRoot: string, path: string): Promise<PlannedC
   };
 }
 
-function runGenerator(command: string, args: string[], cwd: string): Promise<void> {
+function runGenerator(
+  command: string,
+  args: string[],
+  cwd: string,
+  captureStderr = false,
+): Promise<string | undefined> {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, args, { cwd, stdio: "inherit" });
+    const child = spawn(command, args, {
+      cwd,
+      stdio: ["inherit", "inherit", captureStderr ? "pipe" : "inherit"],
+    });
+    let stderr = "";
+    if (captureStderr && child.stderr) {
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+        process.stderr.write(chunk);
+      });
+    }
     child.once("error", (error) => {
       rejectPromise(
         new Error(`Could not start catalog generator "${command}": ${error.message}`, {
@@ -512,7 +538,7 @@ function runGenerator(command: string, args: string[], cwd: string): Promise<voi
     });
     child.once("close", (code, signal) => {
       if (code === 0) {
-        resolvePromise();
+        resolvePromise(captureStderr ? stderr : undefined);
       } else {
         const status = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
         rejectPromise(new Error(`Catalog generator "${command}" failed with ${status}`));
@@ -547,19 +573,23 @@ async function checkGeneratedCatalog(
   projectRoot: string,
   entry: GeneratedCatalogCheck,
   registry: Pick<CatalogAdapterRegistry, "get">,
-): Promise<boolean> {
+): Promise<{ upToDate: boolean; stderrWarnings: string[] }> {
   const temporaryDirectory = await mkdtemp(resolve(tmpdir(), "i18n-pipeline-"));
   const outputName = basename(entry.path);
   const outputPath = resolve(temporaryDirectory, outputName);
   try {
     const args = entry.args.map((argument) => argument.replaceAll(OUTPUT_PLACEHOLDER, outputPath));
-    await runGenerator(entry.command, args, projectRoot);
+    const stderr = await runGenerator(entry.command, args, projectRoot, true);
+    const stderrWarnings =
+      entry.strictStderrWarnings && stderr
+        ? (stderr.match(/^.*\[WARN\].*$/gm) ?? []).map((line) => line.trim())
+        : [];
     if (!entry.adapter) {
       const [checkedIn, generated] = await Promise.all([
         loadJsonFile(projectRoot, entry.path, "Checked-in generated file"),
         loadJsonFile(temporaryDirectory, outputName, "Generated output"),
       ]);
-      return isDeepStrictEqual(checkedIn, generated);
+      return { upToDate: isDeepStrictEqual(checkedIn, generated), stderrWarnings };
     }
     const adapter = registry.get(entry.adapter);
     const context = contextFor(entry.locale ?? "und", entry.role ?? "source", entry.options);
@@ -567,7 +597,10 @@ async function checkGeneratedCatalog(
       loadCatalogFile(projectRoot, entry.path, "Checked-in generated catalog", adapter, context),
       loadCatalogFile(temporaryDirectory, outputName, "Generated output", adapter, context),
     ]);
-    return isDeepStrictEqual(checkedIn.document, generated.document);
+    return {
+      upToDate: isDeepStrictEqual(checkedIn.document, generated.document),
+      stderrWarnings,
+    };
   } finally {
     await rm(temporaryDirectory, { recursive: true, force: true });
   }
@@ -963,7 +996,13 @@ export async function validateCatalogProject(
     try {
       generatedCount += 1;
       const current = await checkGeneratedCatalog(projectRoot, entry, registry);
-      if (!current) {
+      if (current.stderrWarnings.length > 0) {
+        problems.push(
+          `Generated catalog "${entry.path}" generator emitted warnings that strictStderrWarnings treats as errors:\n` +
+            current.stderrWarnings.map((line) => `  ${line}`).join("\n"),
+        );
+      }
+      if (!current.upToDate) {
         const update = entry.updateCommand
           ? `Run \`${entry.updateCommand}\` and commit the result.`
           : "Regenerate the file and commit the result.";
